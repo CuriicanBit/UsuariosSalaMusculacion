@@ -1,16 +1,20 @@
 import express from "express";
 import path from "path";
-import { createServer as createViteServer } from "vite";
 import axios from "axios";
 import * as XLSX from "xlsx";
 import cors from "cors";
 import nodemailer from "nodemailer";
 import { createClient } from "@supabase/supabase-js";
+import fs from "fs";
 
 // Initialize Supabase Client
-// We check env variables, fallback to null to avoid crash on startup if not set yet
 const supabaseUrl = process.env.SUPABASE_URL || "";
 const supabaseKey = process.env.SUPABASE_ANON_KEY || "";
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error("❌ ERROR: SUPABASE_URL o SUPABASE_ANON_KEY no están configuradas en las variables de entorno.");
+}
+
 const supabase = (supabaseUrl && supabaseKey) ? createClient(supabaseUrl, supabaseKey) : null;
 
 async function startServer() {
@@ -69,7 +73,7 @@ async function startServer() {
       excelUrl: "https://aluautonoma365-my.sharepoint.com/:x:/g/personal/talca_gimnasio_reservas_cloud_uautonoma_cl1/IQBAcJZ5RafKQLHVIKpJJKnIAWTGDK9w8yy19ZNIwpHJPkc?e=GGIAO0",
       formUrlTemplate: "https://forms.cloud.microsoft/Pages/ResponsePage.aspx?id=ucHaYEdgmkihNLBwOGzM98CRIjirj0hFgBahBX98C91UQkZVN0JGRTAzWVhONjNWVzVENDE3UkVSWi4u&r58696eaabd0347c8ba03ecfa4dbd36a0=",
       smtpConfig: {
-        host: process.env.SMTP_HOST || '',
+        host: process.env.SMTP_HOST || 'smtp.gmail.com',
         port: process.env.SMTP_PORT || '465',
         user: process.env.SMTP_USER || '',
         pass: process.env.SMTP_PASS || '',
@@ -78,19 +82,24 @@ async function startServer() {
     };
 
     if (!supabase) return defaultSettings;
-    const { data, error } = await supabase.from('gym_settings').select('value').eq('key', 'global_config').single();
-    if (error || !data) return defaultSettings;
     
-    // Merge defaults with DB values (DB takes precedence)
-    const dbSettings = data.value;
-    return {
-      ...defaultSettings,
-      ...dbSettings,
-      smtpConfig: {
-        ...defaultSettings.smtpConfig,
-        ...(dbSettings.smtpConfig || {})
-      }
-    };
+    try {
+      const { data, error } = await supabase.from('gym_settings').select('value').eq('key', 'global_config').single();
+      if (error || !data) return defaultSettings;
+      
+      const dbSettings = data.value;
+      return {
+        ...defaultSettings,
+        ...dbSettings,
+        smtpConfig: {
+          ...defaultSettings.smtpConfig,
+          ...(dbSettings.smtpConfig || {})
+        }
+      };
+    } catch (e) {
+      console.error("[SUPABASE] Error cargando ajustes:", e);
+      return defaultSettings;
+    }
   }
 
   async function saveDbSettings(settings: any) {
@@ -305,23 +314,23 @@ async function startServer() {
     }
   });
 
-  // Serve static files in production
-  if (process.env.NODE_ENV !== "production" && process.env.VITE_DEV_SERVER !== "false") {
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
-    app.use(vite.middlewares);
+  // Vite middleware for development
+  if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
+    try {
+      // @ts-ignore
+      const { createServer: createViteServer } = await import("vite");
+      const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
+      app.use(vite.middlewares);
+    } catch (e) {
+      console.warn("No se pudo cargar Vite middleware:", e);
+    }
   } else {
+    // En Vercel, los archivos estáticos los sirve Vercel directamente
+    // pero dejamos esto como fallback si es necesario
     const distPath = path.join(process.cwd(), "dist");
-    if (require('fs').existsSync(distPath)) {
+    if (fs.existsSync(distPath)) {
       app.use(express.static(distPath));
     }
-    app.get("*", (req, res) => {
-      const indexFile = path.join(process.cwd(), "dist", "index.html");
-      if (require('fs').existsSync(indexFile)) {
-        res.sendFile(indexFile);
-      } else {
-        res.status(404).send("Frontend build not found. Please run 'npm run build'.");
-      }
-    });
   }
 
   // Export for Vercel or listen locally
