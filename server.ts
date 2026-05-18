@@ -4,72 +4,14 @@ import { createServer as createViteServer } from "vite";
 import axios from "axios";
 import * as XLSX from "xlsx";
 import cors from "cors";
-import fs from "fs";
-
 import nodemailer from "nodemailer";
+import { createClient } from "@supabase/supabase-js";
 
-// Simple persistent storage files
-const DB_PATH = path.join(process.cwd(), "users_db.json");
-const SETTINGS_PATH = path.join(process.cwd(), "settings_db.json");
-const DELETED_RUTS_PATH = path.join(process.cwd(), "deleted_ruts.json");
-
-function loadDeletedRuts(): string[] {
-  if (fs.existsSync(DELETED_RUTS_PATH)) {
-    try {
-      return JSON.parse(fs.readFileSync(DELETED_RUTS_PATH, "utf8"));
-    } catch (e) {
-      return [];
-    }
-  }
-  return [];
-}
-
-function saveDeletedRuts(ruts: string[]) {
-  fs.writeFileSync(DELETED_RUTS_PATH, JSON.stringify(ruts, null, 2));
-}
-
-function loadLocalUsers() {
-  if (fs.existsSync(DB_PATH)) {
-    try {
-      return JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-    } catch (e) {
-      return [];
-    }
-  }
-  return [];
-}
-
-function saveLocalUsers(users: any[]) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(users, null, 2));
-}
-
-function loadSettings() {
-  const defaultSettings = {
-    excelUrl: "https://aluautonoma365-my.sharepoint.com/:x:/g/personal/talca_gimnasio_reservas_cloud_uautonoma_cl1/IQBAcJZ5RafKQLHVIKpJJKnIAWTGDK9w8yy19ZNIwpHJPkc?e=GGIAO0",
-    formUrlTemplate: "https://forms.cloud.microsoft/Pages/ResponsePage.aspx?id=ucHaYEdgmkihNLBwOGzM98CRIjirj0hFgBahBX98C91UQkZVN0JGRTAzWVhONjNWVzVENDE3UkVSWi4u&r58696eaabd0347c8ba03ecfa4dbd36a0=",
-    linkCreatedDate: new Date().toISOString(),
-    smtpConfig: {
-      host: 'smtp.gmail.com',
-      port: '587',
-      user: 'uatalca.desarrollo.tic@gmail.com',
-      pass: 'pukw fcqf bjxo wpuj',
-      targetEmail: 'talca.gimnasio.reservas@cloud.uautonoma.cl'
-    }
-  };
-
-  if (fs.existsSync(SETTINGS_PATH)) {
-    try {
-      return { ...defaultSettings, ...JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf8")) };
-    } catch (e) {
-      return defaultSettings;
-    }
-  }
-  return defaultSettings;
-}
-
-function saveSettings(settings: any) {
-  fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2));
-}
+// Initialize Supabase Client
+// We check env variables, fallback to null to avoid crash on startup if not set yet
+const supabaseUrl = process.env.SUPABASE_URL || "";
+const supabaseKey = process.env.SUPABASE_ANON_KEY || "";
+const supabase = (supabaseUrl && supabaseKey) ? createClient(supabaseUrl, supabaseKey) : null;
 
 async function startServer() {
   const app = express();
@@ -78,81 +20,121 @@ async function startServer() {
   app.use(cors());
   app.use(express.json());
 
+  // Helper for RIL normalization
   function normalizeRut(rut: string): string {
     return String(rut || "").trim().toUpperCase();
   }
 
-  function deduplicateUsers(users: any[]) {
-    const seenRuts = new Set();
-    return users.filter(user => {
-      const rut = normalizeRut(user.rut);
-      if (!rut) return true; // Keep entries without RUT just in case, though they shouldn't exist
-      if (seenRuts.has(rut)) return false;
-      seenRuts.add(rut);
-      return true;
-    });
+  // --- Supabase Data Helpers ---
+
+  async function getDbUsers() {
+    if (!supabase) {
+      console.warn("[SUPABASE] Cliente no inicializado. Verifique variables de entorno.");
+      return [];
+    }
+    const { data, error } = await supabase.from('gym_users').select('*');
+    if (error) {
+      console.error("[SUPABASE] Error buscando usuarios:", error.message);
+      return [];
+    }
+    return data.map(u => ({
+      id: u.id,
+      rut: u.rut,
+      fullName: u.full_name,
+      category: u.category,
+      createdAt: u.created_at
+    }));
   }
 
-  let managedUsers: any[] = deduplicateUsers(loadLocalUsers());
-  let globalSettings = loadSettings();
-  let deletedRuts: string[] = loadDeletedRuts();
+  async function saveDbUser(user: any) {
+    if (!supabase) return;
+    const { error } = await supabase.from('gym_users').upsert({
+      id: user.id,
+      rut: user.rut,
+      full_name: user.fullName,
+      category: user.category,
+      created_at: user.createdAt
+    });
+    if (error) console.error("[SUPABASE] Error saving user:", error.message);
+  }
 
-  // Save cleaned database if it was changed
-  saveLocalUsers(managedUsers);
+  async function deleteDbUser(id: string) {
+    if (!supabase) return;
+    const { error } = await supabase.from('gym_users').delete().eq('id', id);
+    if (error) console.error("[SUPABASE] Error deleting user:", error.message);
+  }
 
-  // Settings Endpoints
-  app.get("/api/settings", (req, res) => {
-    res.json(globalSettings);
+  async function getDbSettings() {
+    const defaultSettings = {
+      excelUrl: "https://aluautonoma365-my.sharepoint.com/:x:/g/personal/talca_gimnasio_reservas_cloud_uautonoma_cl1/IQBAcJZ5RafKQLHVIKpJJKnIAWTGDK9w8yy19ZNIwpHJPkc?e=GGIAO0",
+      formUrlTemplate: "https://forms.cloud.microsoft/Pages/ResponsePage.aspx?id=ucHaYEdgmkihNLBwOGzM98CRIjirj0hFgBahBX98C91UQkZVN0JGRTAzWVhONjNWVzVENDE3UkVSWi4u&r58696eaabd0347c8ba03ecfa4dbd36a0=",
+      smtpConfig: {
+        host: process.env.SMTP_HOST || '',
+        port: process.env.SMTP_PORT || '465',
+        user: process.env.SMTP_USER || '',
+        pass: process.env.SMTP_PASS || '',
+        targetEmail: process.env.SMTP_TARGET_EMAIL || ''
+      }
+    };
+
+    if (!supabase) return defaultSettings;
+    const { data, error } = await supabase.from('gym_settings').select('value').eq('key', 'global_config').single();
+    if (error || !data) return defaultSettings;
+    
+    // Merge defaults with DB values (DB takes precedence)
+    const dbSettings = data.value;
+    return {
+      ...defaultSettings,
+      ...dbSettings,
+      smtpConfig: {
+        ...defaultSettings.smtpConfig,
+        ...(dbSettings.smtpConfig || {})
+      }
+    };
+  }
+
+  async function saveDbSettings(settings: any) {
+    if (!supabase) return;
+    const { error } = await supabase.from('gym_settings').upsert({
+      key: 'global_config',
+      value: settings
+    });
+    if (error) console.error("[SUPABASE] Error saving settings:", error.message);
+  }
+
+  // --- Endpoints ---
+
+  app.get("/api/settings", async (req, res) => {
+    const settings = await getDbSettings();
+    res.json(settings);
   });
 
-  app.post("/api/settings", (req, res) => {
-    globalSettings = { ...globalSettings, ...req.body };
-    saveSettings(globalSettings);
-    res.json(globalSettings);
+  app.post("/api/settings", async (req, res) => {
+    const current = await getDbSettings();
+    const updated = { ...current, ...req.body };
+    await saveDbSettings(updated);
+    res.json(updated);
   });
 
-  // Notification Endpoint for Power Automate
   app.post("/api/notify", async (req, res) => {
     const { action, user, targetEmail, smtpConfig } = req.body;
     
     console.log(`[NOTIFY] Recibida solicitud para acción: ${action}, RUT: ${user?.rut}`);
 
-    if (!targetEmail) {
-      console.warn("[NOTIFY] Error: Email de destino faltante en la petición.");
-      return res.status(400).json({ error: "Email de destino faltante" });
-    }
-    if (!smtpConfig || !smtpConfig.user || !smtpConfig.pass) {
-       console.warn("[NOTIFY] Error: Configuración SMTP incompleta en la petición.");
-       return res.status(400).json({ error: "Configuración SMTP incompleta" });
-    }
+    if (!targetEmail) return res.status(400).json({ error: "Email de destino faltante" });
+    if (!smtpConfig || !smtpConfig.user || !smtpConfig.pass) return res.status(400).json({ error: "Configuración SMTP incompleta" });
 
     try {
-      console.log(`[NOTIFY] Preparando envío a: ${targetEmail} vía ${smtpConfig.host}:${smtpConfig.port}`);
-      
       const transporter = nodemailer.createTransport({
         host: smtpConfig.host || "smtp.gmail.com",
-        port: Number(smtpConfig.port || 587),
+        port: Number(smtpConfig.port || 465),
         secure: Number(smtpConfig.port) === 465,
-        auth: {
-          user: smtpConfig.user,
-          pass: smtpConfig.pass,
-        },
-        tls: {
-          rejectUnauthorized: false
-        }
+        auth: { user: smtpConfig.user, pass: smtpConfig.pass },
+        tls: { rejectUnauthorized: false }
       });
 
-      // Aseguramos que la conexión esté bien antes de proceder
-      try {
-        await transporter.verify();
-        console.log("[NOTIFY] Conexión SMTP verificada correctamente.");
-      } catch (verifyError: any) {
-        console.error("[NOTIFY] Error al verificar conexión SMTP:", verifyError.message);
-        throw new Error(`Fallo de conexión SMTP: ${verifyError.message}`);
-      }
-
-      // Sanitize fields: Remove ALL newlines to avoid Excel cell breaking
-      const cleanStr = (s: any) => String(s || "").replace(/[\r\n]+/g, " ").trim();
+      // Cleanup function to remove newlines for Excel compatibility
+      const cleanStr = (s: any) => String(s || "").replace(/[\r\n\t]+/g, " ").trim();
 
       const sanitizedUser = {
         id: cleanStr(user?.id || `local-${Date.now()}`),
@@ -165,109 +147,74 @@ async function startServer() {
       const payload = { action, user: sanitizedUser };
       const jsonStr = JSON.stringify(payload);
       
-      console.log(`[NOTIFY] ENVIANDO PAYLOAD (${action}):`, jsonStr);
+      console.log(`[SMTP-SEND] Intentando enviar correo para ${action} RUT ${sanitizedUser.rut}...`);
 
       const mailOptions = {
         from: `"UA Sede Talca" <${smtpConfig.user}>`,
         to: targetEmail,
         subject: `[GYM-UA-ACTION] ${action}: ${sanitizedUser.rut}`,
         text: jsonStr,
-        html: `<!--JSON_DATA_START-->${jsonStr}<!--JSON_DATA_END--><div style="font-family: sans-serif; max-width: 600px; border: 1px solid #eee; padding: 20px; border-radius: 10px;">
-            <div style="background-color: #002c4b; color: white; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
-              <h2 style="margin: 0; font-size: 18px;">UA Control: Notificación</h2>
+        html: `<!--JSON_DATA_START-->${jsonStr}<!--JSON_DATA_END-->
+          <div style="font-family: sans-serif; max-width: 600px; border: 1px solid #002c4b; padding: 20px; border-radius: 10px;">
+            <div style="background-color: #002c4b; color: white; padding: 15px; border-radius: 5px; margin-bottom: 20px; text-align: center;">
+              <h2 style="margin: 0; font-size: 18px;">UA CONTROL GIMNASIO</h2>
             </div>
-            <p>Se ha detectado una acción de <strong>${action === 'CREATE' ? 'CREACIÓN' : action === 'UPDATE' ? 'ACTUALIZACIÓN' : 'ELIMINACIÓN'}</strong> de usuario.</p>
-            <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-              <tr><td style="padding: 10px; border-bottom: 1px solid #eee; width: 40%;"><strong>RUT:</strong></td><td style="padding: 10px; border-bottom: 1px solid #eee;">${sanitizedUser.rut}</td></tr>
-              <tr><td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Nombre:</strong></td><td style="padding: 10px; border-bottom: 1px solid #eee;">${sanitizedUser.fullName}</td></tr>
-              <tr><td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Categoría:</strong></td><td style="padding: 10px; border-bottom: 1px solid #eee;">${sanitizedUser.category}</td></tr>
-            </table>
-            <div style="margin-top: 30px; padding: 10px; background: #f9f9f9; font-size: 10px; color: #999; border-radius: 5px;">
-              <p>ID de Sistema: ${sanitizedUser.id}</p>
-              <p>Sincronización por Pasarela SMTP (Power Automate)</p>
+            <p style="color: #333; font-size: 14px;">Se ha registrado la siguiente operación en el sistema:</p>
+            <div style="background-color: #f8fbff; padding: 15px; border-radius: 8px; border-left: 5px solid #002c4b;">
+              <p style="margin: 5px 0;"><strong>ACCIÓN:</strong> <span style="color: #d32f2f;">${action === 'CREATE' ? 'CREACIÓN' : action === 'UPDATE' ? 'ACTUALIZACIÓN' : 'ELIMINACIÓN'}</span></p>
+              <p style="margin: 5px 0;"><strong>RUT:</strong> ${sanitizedUser.rut}</p>
+              <p style="margin: 5px 0;"><strong>NOMBRE:</strong> ${sanitizedUser.fullName}</p>
+              <p style="margin: 5px 0;"><strong>CATEGORÍA:</strong> ${sanitizedUser.category}</p>
             </div>
-          </div>`,
+            <p style="font-size: 11px; color: #666; margin-top: 20px; border-top: 1px solid #eee; padding-top: 10px;">
+              Esta notificación es procesada automáticamente para sincronización con SharePoint Excel. 
+              Por favor, no elimine el bloque de datos JSON invisible al inicio de este mensaje.
+            </p>
+          </div>`
       };
 
       const info = await transporter.sendMail(mailOptions);
-      console.log(`[NOTIFY] EXITOSO: MessageId ${info.messageId} para RUT ${sanitizedUser.rut}`);
+      console.log(`[SMTP-SUCCESS] Correo enviado exitosamente: MessageId: ${info.messageId} | RUT: ${sanitizedUser.rut}`);
       res.json({ success: true, messageId: info.messageId });
     } catch (error: any) {
-      console.error("[NOTIFY] Error crítico al enviar notificación:", error.message);
-      res.status(500).json({ 
-        error: "Fallo en el envío de correo", 
-        details: error.message,
-        code: error.code
-      });
+      console.error("[SMTP-ERROR] Falló el envío:", error.message);
+      res.status(500).json({ error: "Fallo envío correo", details: error.message });
     }
   });
 
-  // API Proxy to fetch Excel data from SharePoint
   app.post("/api/sync-excel", async (req, res) => {
     const { url } = req.body;
-    if (!url) {
-      return res.status(400).json({ error: "URL is required" });
-    }
+    if (!url) return res.status(400).json({ error: "URL is required" });
 
     try {
       let downloadUrl = url;
-      
       try {
-        const urlObj = new URL(url);
         if (url.includes("/:x:/g/")) {
           const parts = url.split("/:x:/g/");
           const baseUrl = parts[0];
           const remaining = parts[1];
           const pathParts = remaining.split("/");
-          const idWithParams = pathParts.pop() || "";
-          const id = idWithParams.split("?")[0];
-          const userPath = pathParts.join("/");
-          downloadUrl = `${baseUrl}/${userPath}/_layouts/15/download.aspx?share=${id}`;
-        } else if (!urlObj.searchParams.has("download")) {
-          urlObj.searchParams.set("download", "1");
-          downloadUrl = urlObj.toString();
+          const id = (pathParts.pop() || "").split("?")[0];
+          downloadUrl = `${baseUrl}/${pathParts.join("/")}/_layouts/15/download.aspx?share=${id}`;
         }
-      } catch (e) {
-        return res.status(400).json({ error: "La URL proporcionada no es válida." });
-      }
+      } catch (e) {}
 
-      console.log(`Syncing from SharePoint: ${downloadUrl}`);
-
-      const response = await axios.get(downloadUrl, {
+      console.log(`[SYNC] Iniciando descarga desde SharePoint...`);
+      const response = await axios.get(downloadUrl, { 
         responseType: "arraybuffer",
-        headers: { 
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream, */*"
-        },
-        maxRedirects: 10
+        headers: { "User-Agent": "Mozilla/5.0" }
       });
 
-      console.log(`Response Status: ${response.status}`);
-      console.log(`Content-Type: ${response.headers["content-type"]}`);
-
       const buffer = Buffer.from(response.data);
-      
-      // Safety check for HTML (SharePoint login/error pages)
-      const contentStr = buffer.toString("utf8", 0, 100);
-      if (contentStr.includes("<!DOCTYPE") || contentStr.includes("<html") || String(response.headers["content-type"] || "").includes("text/html")) {
-        console.error("Received HTML instead of Excel data.");
-        return res.status(403).json({ 
-          error: "Vínculo de SharePoint Restringido",
-          details: "El enlace devolvió una página de acceso (HTML) en lugar del archivo Excel. Por favor, asegúrese de que el enlace esté configurado con 'Cualquier persona con el vínculo puede editar' y no esté caducado."
-        });
-      }
-
       const workbook = XLSX.read(buffer, { type: "buffer" });
-      const sheetName = workbook.SheetNames[0];
-      const sheet = workbook.Sheets[sheetName];
-      const data: any[] = XLSX.utils.sheet_to_json(sheet, { header: "A" });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rawData: any[] = XLSX.utils.sheet_to_json(sheet, { header: "A" });
 
-      const excelUsers = data.slice(1).map((row, index) => {
+      const excelUsers = rawData.slice(1).map(row => {
         const rut = normalizeRut(row.A);
         const fullName = String(row.B || "").trim();
         const categoryRaw = String(row.C || "").trim();
         if (!rut || !fullName || rut === "RUT") return null;
-
         return {
           id: `excel-${rut}`,
           rut,
@@ -277,100 +224,80 @@ async function startServer() {
         };
       }).filter(Boolean);
 
-      // Merge Excel users with local users (Local ones take precedence)
-      // Note: We ignore deletedRuts here to ensure consistency with master Excel
-      const seenRuts = new Set(managedUsers.map(u => normalizeRut(u.rut)));
-      const filteredExcelUsers: any[] = [];
+      // We bring ALL users from Excel, preserving existing ones in Supabase
+      const existingUsers = await getDbUsers();
+      const existingRuts = new Set(existingUsers.map(u => normalizeRut(u.rut)));
       
-      excelUsers.forEach((exUser: any) => {
-        const rut = normalizeRut(exUser.rut);
-        // Removed check for deletedRuts.includes(rut)
-        
-        if (!seenRuts.has(rut)) {
-          filteredExcelUsers.push(exUser);
-          seenRuts.add(rut);
+      let count = 0;
+      for (const exUser of excelUsers) {
+        if (exUser && !existingRuts.has(exUser.rut)) {
+          await saveDbUser(exUser);
+          count++;
         }
-      });
+      }
 
-      managedUsers = [...managedUsers, ...filteredExcelUsers];
-      saveLocalUsers(managedUsers);
-      console.log(`Merged ${excelUsers.length} users from Excel. Total: ${managedUsers.length}`);
-
-      res.json({ users: managedUsers });
+      const finalUsers = await getDbUsers();
+      console.log(`[SYNC-DONE] Sincronización exitosa. Nuevos: ${count}. Total DB: ${finalUsers.length}`);
+      res.json({ users: finalUsers });
     } catch (error: any) {
-      console.error("Sync error:", error.message);
-      res.status(500).json({ error: "Error técnico al sincronizar", details: error.message });
+      console.error("[SYNC-ERROR]", error.message);
+      res.status(500).json({ error: "Error en sincronización", details: error.message });
     }
   });
 
-  // CRUD Endpoints
-  app.get("/api/users", (req, res) => {
-    res.json({ users: managedUsers });
+  app.get("/api/users", async (req, res) => {
+    const users = await getDbUsers();
+    res.json({ users });
   });
 
-  app.post("/api/users", (req, res) => {
-    const { rut: rawRut } = req.body;
-    const rut = normalizeRut(rawRut);
+  app.post("/api/users", async (req, res) => {
+    const normalizedRut = normalizeRut(req.body.rut);
+    const existing = await getDbUsers();
     
-    // Check for duplicate RUT
-    if (rut && managedUsers.find(u => normalizeRut(u.rut) === rut)) {
-      return res.status(400).json({ 
-        error: "RUT Duplicado", 
-        details: `El RUT ${rut} ya se encuentra registrado en el sistema.` 
-      });
+    if (normalizedRut && existing.find(u => normalizeRut(u.rut) === normalizedRut)) {
+      return res.status(400).json({ error: "RUT Duplicado", details: `El RUT ${normalizedRut} ya existe.` });
     }
 
     const newUser = {
       ...req.body,
-      rut, // Use normalized RUT
+      rut: normalizedRut,
       id: `local-${Date.now()}`,
       createdAt: new Date().toISOString()
     };
-    
-    // If we re-add a previously deleted user, remove from blacklist
-    if (newUser.rut) {
-      deletedRuts = deletedRuts.filter(r => r !== newUser.rut);
-      saveDeletedRuts(deletedRuts);
-    }
 
-    managedUsers = [newUser, ...managedUsers];
-    saveLocalUsers(managedUsers);
+    await saveDbUser(newUser);
     res.status(201).json(newUser);
   });
 
-  app.put("/api/users/:id", (req, res) => {
+  app.put("/api/users/:id", async (req, res) => {
     const { id } = req.params;
-    managedUsers = managedUsers.map(u => u.id === id ? { ...u, ...req.body } : u);
-    saveLocalUsers(managedUsers);
-    res.json(managedUsers.find(u => u.id === id));
+    const existing = await getDbUsers();
+    const user = existing.find(u => u.id === id);
+    if (user) {
+      const updated = { ...user, ...req.body };
+      await saveDbUser(updated);
+      res.json(updated);
+    } else {
+      res.status(404).json({ error: "User not found" });
+    }
   });
 
-  app.delete("/api/users/:id", (req, res) => {
+  app.delete("/api/users/:id", async (req, res) => {
     const { id } = req.params;
-    const userToDelete = managedUsers.find(u => u.id === id);
-    
-    if (userToDelete && userToDelete.rut) {
-      if (!deletedRuts.includes(userToDelete.rut)) {
-        deletedRuts.push(userToDelete.rut);
-        saveDeletedRuts(deletedRuts);
-      }
-    }
-
-    managedUsers = managedUsers.filter(u => u.id !== id);
-    saveLocalUsers(managedUsers);
+    await deleteDbUser(id);
     res.status(204).send();
   });
 
-  // Download Modified Excel
-  app.get("/api/download-excel", (req, res) => {
+  app.get("/api/download-excel", async (req, res) => {
     try {
-      const exportData = managedUsers.map(u => [u.rut, u.fullName, u.category]);
+      const users = await getDbUsers();
+      const exportData = users.map(u => [u.rut, u.fullName, u.category]);
       const ws = XLSX.utils.aoa_to_sheet([["RUT", "Nombre Completo", "Categoría"], ...exportData]);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "Usuarios");
       const buffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
 
-      res.setHeader("Content-Disposition", "attachment; filename=Usuarios_Actualizados.xlsx");
+      res.setHeader("Content-Disposition", "attachment; filename=Usuarios_Gimnasio.xlsx");
       res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
       res.send(buffer);
     } catch (e: any) {
@@ -378,24 +305,35 @@ async function startServer() {
     }
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+  // Serve static files in production
+  if (process.env.NODE_ENV !== "production" && process.env.VITE_DEV_SERVER !== "false") {
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
+    if (require('fs').existsSync(distPath)) {
+      app.use(express.static(distPath));
+    }
     app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
+      const indexFile = path.join(process.cwd(), "dist", "index.html");
+      if (require('fs').existsSync(indexFile)) {
+        res.sendFile(indexFile);
+      } else {
+        res.status(404).send("Frontend build not found. Please run 'npm run build'.");
+      }
     });
   }
 
+  // Export for Vercel or listen locally
+  if (process.env.VERCEL) {
+    return app;
+  }
+
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`[SERVER] Ready on port ${PORT}`);
   });
+  
+  return app;
 }
 
-startServer();
+export default startServer();
