@@ -31,82 +31,235 @@ const PORT = 3000;
 app.use(cors());
 app.use(express.json());
 
-// Helper for RUT normalization
+// Helpers for RUT normalization
+function cleanRut(rut: string): string {
+  return String(rut || "").replace(/[^0-9kK]/g, "").toUpperCase();
+}
+
 function normalizeRut(rut: string): string {
-  return String(rut || "").trim().toUpperCase();
+  const clean = cleanRut(rut);
+  if (clean.length < 2) return clean;
+  const dv = clean.slice(-1);
+  const num = clean.slice(0, -1);
+  
+  let formatted = "";
+  let i = num.length;
+  while (i > 0) {
+    formatted = (i - 3 > 0 ? "." : "") + num.slice(Math.max(0, i - 3), i) + formatted;
+    i -= 3;
+  }
+  return `${formatted}-${dv}`;
 }
 
-// --- Supabase Data Helpers ---
+// --- Local Store Persistence Helper ---
 
-async function getDbUsers() {
-  if (!supabase) {
-    console.warn("[SUPABASE] Cliente no inicializado. Verifique variables de entorno.");
-    return [];
-  }
+const DATA_DIR = path.join(process.cwd(), "data");
+const STORE_FILE = path.join(DATA_DIR, "store.json");
+
+interface GymUser {
+  id: string;
+  rut: string;
+  fullName: string;
+  category: string;
+  createdAt: string;
+}
+
+interface LocalStore {
+  users: GymUser[];
+  deletedRuts: string[];
+  settings: any;
+}
+
+function loadLocalStore(): LocalStore {
   try {
-    const { data, error } = await supabase.from('gym_users').select('*');
-    if (error) {
-      console.error("[SUPABASE] Error buscando usuarios:", error.message);
-      return [];
+    if (fs.existsSync(STORE_FILE)) {
+      const content = fs.readFileSync(STORE_FILE, "utf-8");
+      const parsed = JSON.parse(content);
+      return {
+        users: Array.isArray(parsed.users) ? parsed.users : [],
+        deletedRuts: Array.isArray(parsed.deletedRuts) ? parsed.deletedRuts : [],
+        settings: parsed.settings || null
+      };
     }
-    return (data || []).map(u => ({
-      id: u.id,
-      rut: u.rut,
-      fullName: u.full_name,
-      category: u.category,
-      createdAt: u.created_at
-    }));
   } catch (e: any) {
-    console.error("[SUPABASE] Excepción buscando usuarios:", e.message);
-    return [];
+    console.error("[STORE] Error leyendo store.json:", e.message);
+  }
+  return { users: [], deletedRuts: [], settings: null };
+}
+
+function saveLocalStore(store: LocalStore) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(STORE_FILE, JSON.stringify(store, null, 2), "utf-8");
+  } catch (e: any) {
+    console.error("[STORE] Error guardando store.json:", e.message);
   }
 }
 
-async function saveDbUser(user: any) {
-  if (!supabase) return;
-  try {
-    const { error } = await supabase.from('gym_users').upsert({
-      id: user.id,
-      rut: user.rut,
-      full_name: user.fullName,
-      category: user.category,
-      created_at: user.createdAt
-    });
-    if (error) console.error("[SUPABASE] Error saving user:", error.message);
-  } catch (e: any) {
-    console.error("[SUPABASE] Excepción guardando usuario:", e.message);
+let localStore: LocalStore = loadLocalStore();
+
+// --- Supabase Data Helpers (with Local Fallback) ---
+
+async function getDbUsers(): Promise<GymUser[]> {
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from('gym_users').select('*');
+      if (!error && Array.isArray(data)) {
+        const dbUsers: GymUser[] = data.map(u => ({
+          id: u.id,
+          rut: u.rut,
+          fullName: u.full_name,
+          category: u.category,
+          createdAt: u.created_at
+        }));
+
+        const deletedSet = new Set(localStore.deletedRuts.map(cleanRut));
+        const mergedMap = new Map<string, GymUser>();
+
+        for (const u of localStore.users) {
+          const cRut = cleanRut(u.rut);
+          if (!deletedSet.has(cRut)) {
+            mergedMap.set(cRut, u);
+          }
+        }
+
+        for (const u of dbUsers) {
+          const cRut = cleanRut(u.rut);
+          if (!deletedSet.has(cRut)) {
+            mergedMap.set(cRut, u);
+          }
+        }
+
+        localStore.users = Array.from(mergedMap.values());
+        saveLocalStore(localStore);
+        return localStore.users;
+      }
+    } catch {
+      // Supabase unavailable - fallback gracefully to local store
+    }
   }
+
+  const deletedSet = new Set(localStore.deletedRuts.map(cleanRut));
+  return localStore.users.filter(u => !deletedSet.has(cleanRut(u.rut)));
+}
+
+async function saveDbUser(user: any): Promise<GymUser> {
+  const normRut = normalizeRut(user.rut);
+  const cRut = cleanRut(user.rut);
+  const sanitizedUser: GymUser = {
+    id: user.id || `local-${Date.now()}`,
+    rut: normRut,
+    fullName: user.fullName || "Sin Nombre",
+    category: user.category || "Funcionario",
+    createdAt: user.createdAt || new Date().toISOString()
+  };
+
+  // Remove from deletedRuts if re-creating
+  localStore.deletedRuts = localStore.deletedRuts.filter(r => cleanRut(r) !== cRut);
+
+  const idx = localStore.users.findIndex(u => u.id === sanitizedUser.id || cleanRut(u.rut) === cRut);
+  if (idx >= 0) {
+    localStore.users[idx] = sanitizedUser;
+  } else {
+    localStore.users.unshift(sanitizedUser);
+  }
+  saveLocalStore(localStore);
+
+  if (supabase) {
+    try {
+      await supabase.from('gym_users').upsert({
+        id: sanitizedUser.id,
+        rut: sanitizedUser.rut,
+        full_name: sanitizedUser.fullName,
+        category: sanitizedUser.category,
+        created_at: sanitizedUser.createdAt
+      });
+    } catch {
+      // Supabase update failed - saved locally
+    }
+  }
+
+  return sanitizedUser;
 }
 
 async function saveDbUsersBulk(usersList: any[]) {
-  if (!supabase || usersList.length === 0) return;
-  try {
-    const rows = usersList.map(user => ({
-      id: user.id,
-      rut: user.rut,
-      full_name: user.fullName,
-      category: user.category,
-      created_at: user.createdAt
-    }));
-    const { error } = await supabase.from('gym_users').upsert(rows);
-    if (error) {
-      console.error("[SUPABASE] Error in bulk upsert:", error.message);
-      throw error;
+  if (!usersList || usersList.length === 0) return;
+
+  const deletedSet = new Set(localStore.deletedRuts.map(cleanRut));
+  const validUsers: GymUser[] = [];
+
+  for (const user of usersList) {
+    const cRut = cleanRut(user.rut);
+    if (deletedSet.has(cRut)) continue;
+
+    const sanitized: GymUser = {
+      id: user.id || `excel-${user.rut}`,
+      rut: normalizeRut(user.rut),
+      fullName: user.fullName || "Sin Nombre",
+      category: user.category || "Funcionario",
+      createdAt: user.createdAt || new Date().toISOString()
+    };
+    validUsers.push(sanitized);
+
+    const idx = localStore.users.findIndex(u => u.id === sanitized.id || cleanRut(u.rut) === cRut);
+    if (idx >= 0) {
+      localStore.users[idx] = sanitized;
+    } else {
+      localStore.users.push(sanitized);
     }
-    console.log(`[SUPABASE] Bulk upsert exitoso de ${rows.length} usuarios.`);
-  } catch (e: any) {
-    console.error("[SUPABASE] Excepción en bulk upsert:", e.message);
-    throw e;
+  }
+  saveLocalStore(localStore);
+
+  if (supabase && validUsers.length > 0) {
+    try {
+      const rows = validUsers.map(u => ({
+        id: u.id,
+        rut: u.rut,
+        full_name: u.fullName,
+        category: u.category,
+        created_at: u.createdAt
+      }));
+      await supabase.from('gym_users').upsert(rows);
+    } catch {
+      // Supabase bulk upsert failed - saved locally
+    }
   }
 }
 
 async function deleteDbUser(id: string) {
-  if (!supabase) return;
-  try {
-    const { error } = await supabase.from('gym_users').delete().eq('id', id);
-    if (error) console.error("[SUPABASE] Error deleting user:", error.message);
-  } catch (e: any) {
-    console.error("[SUPABASE] Excepción eliminando usuario:", e.message);
+  const targetUser = localStore.users.find(u => u.id === id || cleanRut(u.rut) === cleanRut(id));
+  if (targetUser) {
+    const cRut = cleanRut(targetUser.rut);
+    if (!localStore.deletedRuts.includes(cRut)) {
+      localStore.deletedRuts.push(cRut);
+    }
+    localStore.users = localStore.users.filter(u => u.id !== targetUser.id && cleanRut(u.rut) !== cRut);
+    saveLocalStore(localStore);
+
+    if (supabase) {
+      try {
+        await supabase.from('gym_users').delete().or(`id.eq.${targetUser.id},rut.eq.${targetUser.rut}`);
+      } catch {
+        // Supabase delete failed - handled locally
+      }
+    }
+  } else {
+    const cRut = cleanRut(id);
+    if (cRut.length >= 7) {
+      if (!localStore.deletedRuts.includes(cRut)) {
+        localStore.deletedRuts.push(cRut);
+      }
+      saveLocalStore(localStore);
+    }
+    if (supabase) {
+      try {
+        await supabase.from('gym_users').delete().eq('id', id);
+      } catch {
+        // Supabase delete failed - handled locally
+      }
+    }
   }
 }
 
@@ -123,37 +276,53 @@ async function getDbSettings() {
     }
   };
 
-  if (!supabase) return defaultSettings;
-  
-  try {
-    const { data, error } = await supabase.from('gym_settings').select('value').eq('key', 'global_config').single();
-    if (error || !data) return defaultSettings;
-    
-    const dbSettings = data.value;
+  if (localStore.settings) {
     return {
       ...defaultSettings,
-      ...dbSettings,
+      ...localStore.settings,
       smtpConfig: {
         ...defaultSettings.smtpConfig,
-        ...(dbSettings.smtpConfig || {})
+        ...(localStore.settings.smtpConfig || {})
       }
     };
-  } catch (e) {
-    console.error("[SUPABASE] Error cargando ajustes:", e);
-    return defaultSettings;
   }
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from('gym_settings').select('value').eq('key', 'global_config').single();
+      if (!error && data?.value) {
+        localStore.settings = data.value;
+        saveLocalStore(localStore);
+        return {
+          ...defaultSettings,
+          ...data.value,
+          smtpConfig: {
+            ...defaultSettings.smtpConfig,
+            ...(data.value.smtpConfig || {})
+          }
+        };
+      }
+    } catch {
+      // Supabase settings fetch failed - using local settings
+    }
+  }
+
+  return defaultSettings;
 }
 
 async function saveDbSettings(settings: any) {
-  if (!supabase) return;
-  try {
-    const { error } = await supabase.from('gym_settings').upsert({
-      key: 'global_config',
-      value: settings
-    });
-    if (error) console.error("[SUPABASE] Error saving settings:", error.message);
-  } catch (e: any) {
-    console.error("[SUPABASE] Excepción guardando ajustes:", e.message);
+  localStore.settings = settings;
+  saveLocalStore(localStore);
+
+  if (supabase) {
+    try {
+      await supabase.from('gym_settings').upsert({
+        key: 'global_config',
+        value: settings
+      });
+    } catch {
+      // Supabase settings save failed - saved locally
+    }
   }
 }
 
@@ -264,11 +433,14 @@ app.post("/api/sync-excel", async (req, res) => {
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
     const rawData: any[] = XLSX.utils.sheet_to_json(sheet, { header: "A" });
 
+    const deletedSet = new Set(localStore.deletedRuts.map(cleanRut));
+
     const excelUsers = rawData.slice(1).map(row => {
       const rut = normalizeRut(row.A);
+      const cRut = cleanRut(row.A);
       const fullName = String(row.B || "").trim();
       const categoryRaw = String(row.C || "").trim();
-      if (!rut || !fullName || rut === "RUT") return null;
+      if (!rut || !fullName || rut === "RUT" || deletedSet.has(cRut)) return null;
       return {
         id: `excel-${rut}`,
         rut,
@@ -280,13 +452,12 @@ app.post("/api/sync-excel", async (req, res) => {
 
     console.log(`[SYNC] Cargados ${excelUsers.length} usuarios desde el Excel.`);
 
-    // We bring ALL users from Supabase to filter out existing ones
     const existingUsers = await getDbUsers();
-    const existingRuts = new Set(existingUsers.map(u => normalizeRut(u.rut)));
+    const existingRuts = new Set(existingUsers.map(u => cleanRut(u.rut)));
     
     const newUsersToSave = [];
     for (const exUser of excelUsers) {
-      if (exUser && !existingRuts.has(exUser.rut)) {
+      if (exUser && !existingRuts.has(cleanRut(exUser.rut))) {
         newUsersToSave.push(exUser);
       }
     }
@@ -316,7 +487,7 @@ app.post("/api/users", async (req, res) => {
   const normalizedRut = normalizeRut(req.body.rut);
   const existing = await getDbUsers();
   
-  if (normalizedRut && existing.find(u => normalizeRut(u.rut) === normalizedRut)) {
+  if (normalizedRut && existing.find(u => cleanRut(u.rut) === cleanRut(normalizedRut))) {
     return res.status(400).json({ error: "RUT Duplicado", details: `El RUT ${normalizedRut} ya existe.` });
   }
 

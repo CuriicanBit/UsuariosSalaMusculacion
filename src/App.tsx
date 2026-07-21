@@ -588,9 +588,25 @@ function UserModal({ title, user, onClose, onSave, existingRuts = [] }: UserModa
     category: user?.category || UserCategory.FUNCIONARIO,
   });
 
-  const normalizeRut = (r: string) => r.trim().toUpperCase();
+  const cleanRut = (r: string) => String(r || "").replace(/[^0-9kK]/g, "").toUpperCase();
+
+  const normalizeRut = (r: string) => {
+    const clean = cleanRut(r);
+    if (clean.length < 2) return clean;
+    const dv = clean.slice(-1);
+    const num = clean.slice(0, -1);
+    
+    let formatted = "";
+    let i = num.length;
+    while (i > 0) {
+      formatted = (i - 3 > 0 ? "." : "") + num.slice(Math.max(0, i - 3), i) + formatted;
+      i -= 3;
+    }
+    return `${formatted}-${dv}`;
+  };
+
   const normalizedInputRut = normalizeRut(formData.rut);
-  const isDuplicateRut = !user && existingRuts.map(normalizeRut).includes(normalizedInputRut);
+  const isDuplicateRut = !user && existingRuts.map(cleanRut).includes(cleanRut(formData.rut));
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
