@@ -61,33 +61,46 @@ export default function App() {
   const [users, setUsers] = useState<GymUser[]>([]);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isSettingsLoading, setIsSettingsLoading] = useState(true);
+  const [loadingMessage, setLoadingMessage] = useState('Iniciando la aplicación...');
 
   // Load Settings and Users from Server
   useEffect(() => {
+    let isMounted = true;
     const initApp = async () => {
       try {
+        if (isMounted) setLoadingMessage('Conectando con el servidor y cargando ajustes...');
         const settingsRes = await fetch('/api/settings');
         const settings = await settingsRes.json();
-        setExcelUrl(settings.excelUrl);
-        setFormUrlTemplate(settings.formUrlTemplate);
-        setLinkCreatedDate(settings.linkCreatedDate);
-        setSmtpConfig(settings.smtpConfig);
+        
+        if (isMounted) {
+          setExcelUrl(settings.excelUrl || '');
+          setFormUrlTemplate(settings.formUrlTemplate || '');
+          setLinkCreatedDate(settings.linkCreatedDate || new Date().toISOString());
+          if (settings.smtpConfig) setSmtpConfig(settings.smtpConfig);
+        }
 
+        if (isMounted) setLoadingMessage('Obteniendo registros de la Sala de Musculación...');
         const usersRes = await fetch('/api/users');
         const userData = await usersRes.json();
-        if (userData.users && userData.users.length > 0) {
+
+        if (isMounted && userData.users && userData.users.length > 0) {
           setUsers(userData.users);
-        } else {
-          // If no local users, try syncing once
-          handleSync(settings.excelUrl);
+        }
+
+        if (settings.excelUrl) {
+          if (isMounted) setLoadingMessage('Sincronizando registros actualizados desde Excel/SharePoint...');
+          await handleSync(settings.excelUrl, true);
         }
       } catch (error) {
-        console.error("Failed to load initial data:", error);
+        console.error("Error al cargar datos iniciales:", error);
       } finally {
-        setIsSettingsLoading(false);
+        if (isMounted) {
+          setIsSettingsLoading(false);
+        }
       }
     };
     initApp();
+    return () => { isMounted = false; };
   }, []);
 
   const handleConfigClick = () => {
@@ -242,7 +255,7 @@ export default function App() {
     return diffDays;
   }, [linkCreatedDate]);
 
-  const handleSync = async (overrideUrl?: string | any) => {
+  const handleSync = async (overrideUrl?: string | any, isSilent = false) => {
     // Ensure we don't use the React Event object as a URL if called from onClick directly
     const urlToUse = (typeof overrideUrl === 'string' ? overrideUrl : null) || excelUrl;
     if (!urlToUse) return;
@@ -270,22 +283,21 @@ export default function App() {
 
       if (data.users && Array.isArray(data.users)) {
         setUsers(data.users);
-        alert(`Sincronización exitosa: ${data.users.length} usuarios cargados.`);
+        if (!isSilent) {
+          alert(`Sincronización exitosa: ${data.users.length} usuarios cargados.`);
+        }
       } else {
         throw new Error('Formato de datos inválido desde el servidor');
       }
     } catch (error: any) {
-      console.error(error);
-      alert(`Error de sincronización: ${error.message}`);
+      console.error("Error en sincronización:", error);
+      if (!isSilent) {
+        alert(`Error de sincronización: ${error.message}`);
+      }
     } finally {
       setIsSyncing(false);
     }
   };
-
-  useEffect(() => {
-    // Initial auto-sync on load
-    handleSync();
-  }, [excelUrl]);
 
   const handleRenewLink = () => {
     const newDate = new Date().toISOString();
@@ -361,8 +373,85 @@ export default function App() {
     }
   };
 
+  if (isSettingsLoading) {
+    return (
+      <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-gradient-to-br from-primary via-primary-dark to-slate-900 text-white p-6 select-none">
+        <motion.div 
+          initial={{ opacity: 0, scale: 0.9, y: 15 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          transition={{ duration: 0.4, ease: "easeOut" }}
+          className="max-w-md w-full bg-white text-primary rounded-3xl p-8 shadow-2xl border border-white/20 text-center flex flex-col items-center relative overflow-hidden"
+        >
+          {/* Top colored accent bar */}
+          <div className="absolute top-0 left-0 right-0 h-2 bg-gradient-to-r from-primary via-secondary to-primary" />
+
+          {/* Logo container with animated spinner ring */}
+          <div className="relative mb-6 mt-2">
+            <div className="w-24 h-24 bg-surface-container rounded-2xl flex items-center justify-center p-4 shadow-inner border border-outline-variant">
+              <img src={uaLogo} alt="Logo UA" className="w-full h-full object-contain" />
+            </div>
+            <motion.div 
+              animate={{ rotate: 360 }}
+              transition={{ repeat: Infinity, duration: 3, ease: "linear" }}
+              className="absolute -inset-2.5 rounded-3xl border-2 border-dashed border-secondary/60 pointer-events-none"
+            />
+            <div className="absolute -bottom-2 -right-2 bg-secondary text-on-secondary p-2.5 rounded-xl shadow-lg flex items-center justify-center">
+              <RefreshCw size={18} className="animate-spin text-primary" />
+            </div>
+          </div>
+
+          <h2 className="text-xl font-black text-primary tracking-tight mb-1">
+            UA CONTROL MUSCULACIÓN
+          </h2>
+
+          <div className="flex items-center gap-2 mb-4 px-3 py-1 bg-primary/5 rounded-full border border-primary/10">
+            <Dumbbell size={14} className="text-secondary animate-pulse" />
+            <span className="text-[10px] font-black uppercase tracking-wider text-primary">Iniciando Aplicación</span>
+          </div>
+          
+          <p className="text-xs text-on-surface-variant font-medium leading-relaxed mb-6 px-2">
+            Por favor espere un momento mientras cargamos los datos y sincronizamos los registros...
+          </p>
+
+          {/* Animated loading bar */}
+          <div className="w-full bg-surface-container-high h-2.5 rounded-full overflow-hidden mb-5 relative border border-outline-variant">
+            <motion.div 
+              className="bg-secondary h-full rounded-full"
+              animate={{ x: ["-100%", "100%"] }}
+              transition={{ repeat: Infinity, duration: 1.5, ease: "easeInOut" }}
+              style={{ width: "55%" }}
+            />
+          </div>
+
+          {/* Live status badge */}
+          <div className="flex items-center justify-center gap-2.5 text-[11px] font-bold text-primary/80 bg-surface-container px-4 py-3 rounded-2xl w-full border border-outline-variant/60 shadow-sm">
+            <RefreshCcw size={14} className="animate-spin text-secondary shrink-0" />
+            <span className="truncate">{loadingMessage}</span>
+          </div>
+        </motion.div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen flex bg-background">
+      {/* Floating Sync Status Toast */}
+      <AnimatePresence>
+        {isSyncing && (
+          <motion.div
+            initial={{ opacity: 0, y: -20, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -20, scale: 0.95 }}
+            className="fixed top-5 right-5 z-50 bg-primary text-white px-5 py-3.5 rounded-2xl shadow-2xl flex items-center gap-3 border border-white/20"
+          >
+            <RefreshCw size={18} className="animate-spin text-secondary" />
+            <div>
+              <p className="text-xs font-black uppercase tracking-wider">Sincronizando Datos</p>
+              <p className="text-[10px] text-white/70 font-medium">Actualizando registros con Excel...</p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       {/* SideNavBar */}
       <aside className="h-screen w-72 fixed left-0 top-0 bg-primary shadow-2xl flex flex-col px-md py-xl z-40">
         <div className="mb-xl flex flex-col items-center gap-md px-sm text-center">
