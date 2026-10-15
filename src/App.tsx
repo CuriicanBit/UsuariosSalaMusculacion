@@ -31,7 +31,8 @@ import {
   ExternalLink,
   CalendarClock,
   Mail,
-  Send
+  Send,
+  Copy
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ViewType, UserCategory, GymUser } from './types';
@@ -1140,6 +1141,18 @@ function PrintingCenter({ users, formUrlTemplate }: { users: GymUser[], formUrlT
     }
   };
 
+  const copyToClipboard = (rut: string, name: string) => {
+    // El enlace real es la plantilla + el RUT
+    const fullUrl = formUrlTemplate ? `${formUrlTemplate}${rut}` : 'Falta configurar el enlace en Ajustes';
+    
+    navigator.clipboard.writeText(fullUrl).then(() => {
+      alert(`✅ Enlace de asistencia copiado.\n\nYa puede pegarlo en el WhatsApp o correo de: ${name}`);
+    }).catch(err => {
+      console.error('Error al copiar: ', err);
+      alert('No se pudo copiar el enlace automáticamente. Por favor, use el botón "Descargar Pase" y comparta la imagen.');
+    });
+  };
+
   return (
     <div className="space-y-xl">
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-md print:hidden">
@@ -1196,12 +1209,32 @@ function PrintingCenter({ users, formUrlTemplate }: { users: GymUser[], formUrlT
               <img alt={`QR ${user.rut}`} className="w-48 h-48 sm:w-full sm:h-full object-contain" src={getQrUrl(user.rut)} />
             </div>
             
-            <div className="mb-8 relative z-10 print:mb-2 text-center">
+            <div className="mb-8 relative z-10 print:mb-2 text-center w-full">
               <h3 className="text-headline-sm font-black text-primary leading-tight tracking-tight print:text-xl">{user.fullName}</h3>
               <div className="mt-2 inline-block bg-secondary/10 px-4 py-1 rounded-full print:bg-transparent print:border print:border-black">
                 <p className="text-[10px] text-secondary uppercase font-black tracking-[0.2em] print:text-black print:font-bold">RUT {user.rut}</p>
               </div>
-              <div className="mt-1 print:block hidden text-[10px] font-black uppercase tracking-widest text-black/40">
+              
+              {/* NUEVO: Bloque para copiar enlace manual */}
+              <div className="mt-4 w-full px-2 print:hidden">
+                <p className="text-[9px] text-gray-400 font-bold uppercase tracking-wider mb-1 text-left">Respaldo de Enlace Directo:</p>
+                <div className="flex items-center gap-2 bg-surface-container border border-outline-variant rounded-xl p-1.5">
+                  <span className="text-[10px] text-gray-500 truncate flex-1 text-left pl-2">
+                    {formUrlTemplate ? `${formUrlTemplate}${user.rut}` : '⚠️ Configurar en Ajustes'}
+                  </span>
+                  <button 
+                    onClick={() => copyToClipboard(user.rut, user.fullName)}
+                    className="bg-primary/10 text-primary hover:bg-primary hover:text-white px-3 py-2 rounded-lg transition-colors flex items-center gap-1 shrink-0"
+                    title="Copiar enlace completo para enviar por WhatsApp"
+                  >
+                    <Copy size={14} />
+                    <span className="text-[9px] font-black uppercase tracking-wider">Copiar</span>
+                  </button>
+                </div>
+              </div>
+              {/* FIN NUEVO */}
+
+              <div className="mt-2 print:block hidden text-[10px] font-black uppercase tracking-widest text-black/40">
                 Pase de Acceso UA - {user.category}
               </div>
             </div>
